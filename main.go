@@ -14,6 +14,8 @@ import (
 	"testing"
 
 	"github.com/steveyen/gkvlite"
+	"github.com/couchbase/moss"
+	"github.com/t3rm1n4l/nitro"
 	"strings"
 )
 
