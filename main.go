@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"runtime"
 	"strconv"
+	"sync"
 	"testing"
 	"unsafe"
 
@@ -74,6 +75,10 @@ func main() {
 // MOSS/STORE APIs
 
 func mossWrite(b *testing.B, batchsize int) (d string, s *moss.Store, c moss.Collection) {
+	return mossWriteEx(b, batchsize, false)
+}
+
+func mossWriteEx(b *testing.B, batchsize int, wantSync bool) (d string, s *moss.Store, c moss.Collection) {
 	if batchsize > b.N {
 		batchsize = b.N
 	}
@@ -81,13 +86,40 @@ func mossWrite(b *testing.B, batchsize int) (d string, s *moss.Store, c moss.Col
 	dir := "./mossStore"
 	os.Mkdir(dir, 0777)
 
-	store, err := moss.OpenStore(dir, moss.StoreOptions{})
-	if err != nil || store == nil {
-		b.Error("expected open empty store to work")
+	var err error
+	var m sync.Mutex
+	var waitingForCleanCh chan struct{}
+
+	var store *moss.Store
+	var coll moss.Collection
+
+	co := moss.CollectionOptions{
+		OnEvent: func(event moss.Event) {
+			if event.Kind == moss.EventKindPersisterProgress {
+				stats, err := coll.Stats()
+				if err == nil &&
+					stats.CurDirtyOps <= 0 &&
+					stats.CurDirtyBytes <= 0 &&
+					stats.CurDirtySegments <= 0 {
+					m.Lock()
+					if waitingForCleanCh != nil {
+						waitingForCleanCh <- struct{}{}
+						waitingForCleanCh = nil
+					}
+					m.Unlock()
+				}
+			}
+		},
 	}
 
-	coll, _ := moss.NewCollection(moss.CollectionOptions{})
-	coll.Start()
+	store, coll, err = moss.OpenStoreCollection(dir,
+		moss.StoreOptions{
+			CollectionOptions: co,
+		},
+		moss.StorePersistOptions{})
+	if err != nil || store == nil {
+		b.Error("expected OpenStoreCollection to work")
+	}
 
 	k_arr := make([][]byte, b.N)
 	v_arr := make([][]byte, b.N)
@@ -102,6 +134,8 @@ func mossWrite(b *testing.B, batchsize int) (d string, s *moss.Store, c moss.Col
 
 	cur := 0
 
+	ch := make(chan struct{}, 1)
+
 	for i := 0; i < b.N / batchsize; i++ {
 		batch, err := coll.NewBatch(batchsize, batchsize*16)
 		if err != nil {
@@ -109,9 +143,16 @@ func mossWrite(b *testing.B, batchsize int) (d string, s *moss.Store, c moss.Col
 		}
 
 		for j := 0; j < batchsize; j++ {
-			//batch.Set(k_arr[cur], v_arr[cur])
-			batch.Set(k_arr[cur], nil)
+			kbuf, _ := batch.Alloc(len(k_arr[cur]))
+			copy(kbuf, k_arr[cur])
+			batch.AllocSet(kbuf, nil)
 			cur++
+		}
+
+		if wantSync {
+			m.Lock()
+			waitingForCleanCh = ch
+			m.Unlock()
 		}
 
 		err = coll.ExecuteBatch(batch, moss.WriteOptions{})
@@ -119,14 +160,9 @@ func mossWrite(b *testing.B, batchsize int) (d string, s *moss.Store, c moss.Col
 			b.Error("expected exec batch ok")
 		}
 
-		ss, _ := coll.Snapshot()
-
-		llss, err := store.Persist(ss, moss.StorePersistOptions{})
-		if err != nil || llss == nil {
-			b.Error("expected persist to work")
+		if wantSync {
+			<-ch
 		}
-
-		ss.Close()
 	}
 
 	return dir, store, coll
@@ -154,17 +190,18 @@ func testMossRead(b *testing.B, batchsize int) {
 		v_arr[i] = v
 	}
 
+    readOptions := moss.ReadOptions{NoCopyValue: true}
+
 	b.ResetTimer()
 
 	snapshot, _ := store.Snapshot()
 	for i := 0; i < b.N; i++ {
-		val, err := snapshot.Get(k_arr[i], moss.ReadOptions{})
+		val, err := snapshot.Get(k_arr[i], readOptions)
 		if err != nil {
 			b.Error("expected read to pass")
 		}
-
-		if (val != nil) {
-			b.Error("value mismatch")
+		if len(val) > 0 {
+			b.Error("value should have been len 0")
 		}
 		/*
 		if len(v_arr[i]) == len(val) {
@@ -305,7 +342,10 @@ func testPlasmaRead(b *testing.B, batchsize int) {
 
 	for i := 0; i < b.N; i++ {
 		itm := skiplist.NewIntKeyItem(i)
-		got, _ := w.Lookup(itm)
+		got, err := w.Lookup(itm)
+		if err != nil {
+			b.Errorf("lookup err: %v", err)
+		}
 		if skiplist.CompareInt(itm, got) != 0 {
 			b.Error("mismatch in item")
 		}
